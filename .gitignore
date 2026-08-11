@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# botyaraPAD — настройки (генерируются автоматически)
+settings.json
+tabs.json
+
+# Временные файлы конвертации
+/tmp/botyarapad/
+
+# OS
+.DS_Store
+Thumbs.db
+.directory
