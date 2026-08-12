@@ -24,11 +24,12 @@ class SettingsWindow(QDialog):
         super().__init__(parent)
         self.config = config
         self.setWindowTitle("botyaraPAD — Настройки")
-        self.setMinimumWidth(500)
-        self.setMinimumHeight(450)
+        self.setMinimumWidth(550)
+        self.setMinimumHeight(500)
         self.setModal(True)
 
         self._sources_cache = []
+        self._sinks_cache = []
         self._setup_ui()
         self._load_current_settings()
 
@@ -71,6 +72,32 @@ class SettingsWindow(QDialog):
 
         layout.addWidget(mic_group)
 
+        # ── Группа: Устройства вывода ──
+        output_group = QGroupBox("🔊 Устройства вывода")
+        output_form = QFormLayout(output_group)
+        output_form.setSpacing(8)
+
+        # Выбор устройства вывода для динамика
+        sink_layout = QHBoxLayout()
+        self.sink_combo = QComboBox()
+        self.sink_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        sink_layout.addWidget(self.sink_combo)
+
+        self.refresh_sinks_btn = QPushButton("🔄")
+        self.refresh_sinks_btn.setFixedWidth(40)
+        self.refresh_sinks_btn.setToolTip("Обновить список устройств")
+        self.refresh_sinks_btn.clicked.connect(self._refresh_sinks)
+        sink_layout.addWidget(self.refresh_sinks_btn)
+
+        output_form.addRow("Устройство для звуков:", sink_layout)
+
+        hint_label = QLabel("💡 Оставьте пустым для использования системного устройства по умолчанию")
+        hint_label.setStyleSheet("color: #6c7086; font-size: 11px;")
+        hint_label.setWordWrap(True)
+        output_form.addRow(hint_label)
+
+        layout.addWidget(output_group)
+
         # ── Группа: Воспроизведение ──
         play_group = QGroupBox("🔊 Воспроизведение")
         play_form = QFormLayout(play_group)
@@ -108,9 +135,10 @@ class SettingsWindow(QDialog):
 
         info_text = QLabel(
             "botyaraPAD — звуковая панель для Linux (PipeWire)\n"
-            "Использует: PyQt5, pygame, ffmpeg, PipeWire/PulseAudio\n\n"
+            "Использует: PyQt5, pygame, ffmpeg, PipeWire/PulseAudio, pynput\n\n"
             "Звуки воспроизводятся через виртуальный микрофон,\n"
-            "который можно выбрать в Discord, OBS и других приложениях."
+            "который можно выбрать в Discord, OBS и других приложениях.\n\n"
+            "Горячие клавиши работают на Wayland и X11."
         )
         info_text.setStyleSheet("font-size: 12px;")
         info_text.setWordWrap(True)
@@ -163,8 +191,9 @@ class SettingsWindow(QDialog):
         if theme_index >= 0:
             self.theme_combo.setCurrentIndex(theme_index)
 
-        # Загружаем микрофоны
+        # Загружаем устройства
         self._refresh_sources()
+        self._refresh_sinks()
 
         # Выбираем сохранённый микрофон
         saved_source = self.config.get("source_mic", "")
@@ -172,6 +201,13 @@ class SettingsWindow(QDialog):
             idx = self.source_combo.findData(saved_source)
             if idx >= 0:
                 self.source_combo.setCurrentIndex(idx)
+
+        # Выбираем сохранённый sink
+        saved_sink = self.config.get("speaker_sink", "")
+        if saved_sink:
+            idx = self.sink_combo.findData(saved_sink)
+            if idx >= 0:
+                self.sink_combo.setCurrentIndex(idx)
 
     def _refresh_sources(self):
         """Обновить список доступных микрофонов."""
@@ -190,13 +226,32 @@ class SettingsWindow(QDialog):
                 continue
             self.source_combo.addItem(f"🎤 {desc}", name)
 
+    def _refresh_sinks(self):
+        """Обновить список доступных устройств вывода."""
+        self.sink_combo.clear()
+        self.sink_combo.addItem("(системное по умолчанию)", "")
+
+        sinks = PipeWireVirtualMic.get_available_sinks()
+        self._sinks_cache = sinks
+
+        for sink in sinks:
+            name = sink.get("name", "")
+            desc = sink.get("description", name)
+            # Не показываем наш собственный виртуальный sink
+            device_name = self.config.get("device_name", "botyaraPAD")
+            if device_name.lower() in desc.lower():
+                continue
+            self.sink_combo.addItem(f"🔊 {desc}", name)
+
     def _apply_settings(self):
         """Применить настройки."""
         old_theme = self.config.get("theme", "dark")
+        old_sink = self.config.get("speaker_sink", "")
 
         new_settings = {
             "device_name": self.device_name_input.text().strip() or "botyaraPAD",
             "source_mic": self.source_combo.currentData() or "",
+            "speaker_sink": self.sink_combo.currentData() or "",
             "pass_through_mic": self.pass_through_check.isChecked(),
             "default_play_mode": self.default_mode_combo.currentData(),
             "allow_overlap": self.overlap_check.isChecked(),
@@ -215,12 +270,14 @@ class SettingsWindow(QDialog):
         # Предупреждаем о необходимости перезапуска виртуального микрофона
         old_device = self.config.get("device_name", "botyaraPAD")
         new_device = new_settings["device_name"]
-        if old_device != new_device:
+        new_sink = new_settings["speaker_sink"]
+
+        if old_device != new_device or old_sink != new_sink:
             QMessageBox.information(
                 self,
                 "Перезапуск",
-                "Имя виртуального устройства изменено.\n"
-                "Виртуальный микрофон будет пересоздан."
+                "Настройки устройств изменены.\n"
+                "Аудио-движок будет перезапущен."
             )
 
         self.accept()

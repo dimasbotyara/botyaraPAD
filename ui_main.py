@@ -10,10 +10,10 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QListWidgetItem, QMenu, QAction,
     QFileDialog, QInputDialog, QMessageBox, QApplication,
-    QLineEdit, QLabel, QPushButton
+    QLineEdit, QLabel, QPushButton, QShortcut
 )
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer, QObject
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QKeySequence
 
 from config_manager import ConfigManager
 from sound_manager import SoundLibrary, SoundInfo, SUPPORTED_FORMATS, is_supported_format
@@ -30,6 +30,7 @@ class SignalBridge(QObject):
     duration_loaded = pyqtSignal(int, int)  # tab_index, sound_index
     sound_finished = pyqtSignal(int)         # channel_id
     status_update = pyqtSignal(str)
+    keybind_triggered = pyqtSignal(int, int) # tab_index, sound_index
 
 
 class MainWindow(QMainWindow):
@@ -47,6 +48,7 @@ class MainWindow(QMainWindow):
         self.signals.duration_loaded.connect(self._on_duration_loaded)
         self.signals.sound_finished.connect(self._on_sound_finished)
         self.signals.status_update.connect(self._on_status_update)
+        self.signals.keybind_triggered.connect(self._on_keybind_play)
 
         # Маппинг channel_id -> (tab_index, sound_index)
         self._playing_channels: dict[int, tuple[int, int]] = {}
@@ -56,12 +58,16 @@ class MainWindow(QMainWindow):
         self._search_results = []
         self._is_searching = False
 
+        # Выделенные элементы
+        self._selected_sounds: list[tuple[int, int]] = []  # [(tab_idx, sound_idx), ...]
+
         self._setup_window()
         self._setup_ui()
         self._apply_theme()
         self._setup_callbacks()
         self._start_engine()
         self._load_all_tabs()
+        self._start_keybinds()
 
     def _setup_window(self):
         """Настройка окна."""
@@ -69,7 +75,7 @@ class MainWindow(QMainWindow):
         width = self.config.get("window_width", 900)
         height = self.config.get("window_height", 600)
         self.resize(width, height)
-        self.setMinimumSize(600, 400)
+        self.setMinimumSize(700, 500)
 
     def _setup_ui(self):
         """Создание интерфейса."""
@@ -93,44 +99,58 @@ class MainWindow(QMainWindow):
         self.top_bar.add_sound_clicked.connect(self._on_add_sound)
         main_layout.addWidget(self.top_bar)
 
-        # ── Панель вкладок ──
-        tabs_control_layout = QHBoxLayout()
-        tabs_control_layout.setContentsMargins(10, 4, 10, 0)
-        tabs_control_layout.setSpacing(6)
-
-        self.add_tab_btn = QPushButton("＋")
-        self.add_tab_btn.setFixedSize(28, 28)
-        self.add_tab_btn.setToolTip("Добавить вкладку")
-        self.add_tab_btn.clicked.connect(self._on_add_tab)
-        tabs_control_layout.addWidget(self.add_tab_btn)
-
-        tabs_control_layout.addStretch()
-
-        # Количество играющих
-        self.playing_count_label = QLabel("")
-        self.playing_count_label.setObjectName("statusLabel")
-        tabs_control_layout.addWidget(self.playing_count_label)
-
-        main_layout.addLayout(tabs_control_layout)
-
         # ── Вкладки со звуками ──
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(False)  # Закрытие через контекстное меню
         self.tab_widget.setMovable(True)
         self.tab_widget.tabBarDoubleClicked.connect(self._on_tab_double_clicked)
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
-        # Контекстное меню на вкладках
         self.tab_widget.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tab_widget.tabBar().customContextMenuRequested.connect(self._on_tab_context_menu)
+
+        # ── Угловая панель вкладок (счётчик + кнопка "Новая вкладка") ──
+        tab_corner_widget = QWidget()
+        tab_corner_layout = QHBoxLayout(tab_corner_widget)
+        tab_corner_layout.setContentsMargins(4, 2, 8, 2)
+        tab_corner_layout.setSpacing(10)
+
+        # Количество играющих
+        self.playing_count_label = QLabel("")
+        self.playing_count_label.setObjectName("statusLabel")
+        tab_corner_layout.addWidget(self.playing_count_label)
+
+        # Кнопка добавить вкладку
+        self.add_tab_btn = QPushButton("➕ Вкладка")
+        self.add_tab_btn.setFixedHeight(26)
+        self.add_tab_btn.setCursor(Qt.PointingHandCursor)
+        self.add_tab_btn.setToolTip("Добавить новую вкладку")
+        self.add_tab_btn.clicked.connect(self._on_add_tab)
+        tab_corner_layout.addWidget(self.add_tab_btn)
+
+        self.tab_widget.setCornerWidget(tab_corner_widget, Qt.TopRightCorner)
         main_layout.addWidget(self.tab_widget, stretch=1)
 
         # ── Словарь: tab_index -> SoundListWidget ──
         self.sound_lists: dict[int, SoundListWidget] = {}
 
-        # Таймер обновления количества играющих
+        # Таймер обновления количества играющих и прогрессбаров
         self.playing_timer = QTimer()
         self.playing_timer.timeout.connect(self._update_playing_count)
-        self.playing_timer.start(500)
+        self.playing_timer.start(100)
+
+        # Горячие клавиши приложения
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        """Настройка горячих клавиш приложения."""
+        # Ctrl+F - фокус на поиске
+        self.search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.search_shortcut.activated.connect(self._focus_search)
+
+    def _focus_search(self):
+        """Фокусировка на поле поиска."""
+        self.top_bar.search_input.setFocus()
+        self.top_bar.search_input.selectAll()
 
     def _apply_theme(self):
         """Применить текущую тему."""
@@ -146,7 +166,7 @@ class MainWindow(QMainWindow):
         """Callback из фонового потока — отправляем сигнал в GUI."""
         self.signals.sound_finished.emit(channel_id)
 
-    # ═══ Запуск движка ═══════════════════════════════════════════
+    # ═══ Запуск движка и биндов ═════════════════════════════════
 
     def _start_engine(self):
         """Запустить аудио-движок в фоне."""
@@ -159,6 +179,18 @@ class MainWindow(QMainWindow):
 
         thread = threading.Thread(target=_start, daemon=True)
         thread.start()
+
+    def _start_keybinds(self):
+        """Запустить систему биндингов."""
+        def play_callback(tab_idx: int, sound_idx: int):
+            # Вызываем через сигнал чтобы быть в GUI потоке
+            self.signals.keybind_triggered.emit(tab_idx, sound_idx)
+
+        self.library.start_keybinds(play_callback)
+
+    def _on_keybind_play(self, tab_index: int, sound_index: int):
+        """Воспроизведение по биндингу."""
+        self._on_sound_play(tab_index, sound_index, "default")
 
     # ═══ Загрузка вкладок ════════════════════════════════════════
 
@@ -187,8 +219,20 @@ class MainWindow(QMainWindow):
         sound_list.sound_play_requested.connect(
             lambda si, mode, idx=tab_index: self._on_sound_play(idx, si, mode)
         )
+        sound_list.sound_pause_requested.connect(
+            lambda si, idx=tab_index: self._on_sound_pause(idx, si)
+        )
+        sound_list.sound_stop_requested.connect(
+            lambda si, idx=tab_index: self._on_sound_stop(idx, si)
+        )
         sound_list.sound_context_menu.connect(
             lambda si, pos, idx=tab_index: self._on_sound_context_menu(idx, si, pos)
+        )
+        sound_list.sounds_reordered.connect(
+            lambda from_i, to_i, idx=tab_index: self._on_sounds_reordered(idx, from_i, to_i)
+        )
+        sound_list.selection_changed.connect(
+            lambda indices, idx=tab_index: self._on_selection_changed(idx, indices)
         )
 
         self.sound_lists[tab_index] = sound_list
@@ -207,7 +251,24 @@ class MainWindow(QMainWindow):
         for i, sound in enumerate(sounds):
             item = QListWidgetItem()
             widget = SoundItemWidget(sound, i)
-            item.setSizeHint(QSize(0, 52 if not sound.custom_name else 64))
+            widget.play_requested.connect(
+                lambda si, mode, ti=tab_index: self._on_sound_play(ti, si, mode)
+            )
+            widget.pause_requested.connect(
+                lambda si, ti=tab_index: self._on_sound_pause(ti, si)
+            )
+            widget.stop_requested.connect(
+                lambda si, ti=tab_index: self._on_sound_stop(ti, si)
+            )
+
+            # Высота зависит от наличия кастомного имени и биндинга
+            base_height = 58
+            if sound.custom_name:
+                base_height += 14
+            if sound.keybind:
+                base_height += 4
+
+            item.setSizeHint(QSize(0, base_height))
             sound_list.addItem(item)
             sound_list.setItemWidget(item, widget)
 
@@ -350,6 +411,16 @@ class MainWindow(QMainWindow):
         else:
             self.top_bar.set_status("⚠️ Не удалось добавить звуки")
 
+    def _on_sounds_reordered(self, tab_index: int, from_index: int, to_index: int):
+        """Обработка перестановки звуков."""
+        self.library.move_sound(tab_index, from_index, to_index)
+        self._refresh_sound_list(tab_index)
+        self.top_bar.set_status("✅ Звук перемещён")
+
+    def _on_selection_changed(self, tab_index: int, indices: list):
+        """Изменение выделения звуков."""
+        self._selected_sounds = [(tab_index, idx) for idx in indices]
+
     def _on_sound_play(self, tab_index: int, sound_index: int, play_mode: str):
         """Запрос воспроизведения звука."""
         # Если мы в режиме поиска — используем реальные индексы
@@ -379,10 +450,6 @@ class MainWindow(QMainWindow):
 
         # Определяем режим воспроизведения
         if play_mode == "default":
-            play_mode = self.config.get("default_play_mode", "both")
-
-        # Если play_mode не задан явно, используем дефолтный
-        if not play_mode or play_mode == "both":
             play_mode = sound.play_mode or self.config.get("default_play_mode", "both")
 
         # Получаем WAV путь
@@ -416,13 +483,39 @@ class MainWindow(QMainWindow):
         thread = threading.Thread(target=_play_thread, daemon=True)
         thread.start()
 
+    def _on_sound_pause(self, tab_index: int, sound_index: int):
+        """Пауза / снятие с паузы звука."""
+        if self._is_searching and self._search_results:
+            if 0 <= sound_index < len(self._search_results):
+                tab_index, sound_index, _ = self._search_results[sound_index]
+
+        with self._playing_lock:
+            for ch_id, (ti, si) in list(self._playing_channels.items()):
+                if ti == tab_index and si == sound_index:
+                    self.engine.toggle_pause(ch_id)
+                    return
+
+    def _on_sound_stop(self, tab_index: int, sound_index: int):
+        """Остановить конкретный звук."""
+        if self._is_searching and self._search_results:
+            if 0 <= sound_index < len(self._search_results):
+                tab_index, sound_index, _ = self._search_results[sound_index]
+
+        with self._playing_lock:
+            to_remove = [ch_id for ch_id, (ti, si) in self._playing_channels.items() if ti == tab_index and si == sound_index]
+            for ch_id in to_remove:
+                self.engine.stop_sound(ch_id)
+                self._playing_channels.pop(ch_id, None)
+
+        self._update_sound_widget_playing(tab_index, sound_index, False)
+
     def _on_sound_context_menu(self, tab_index: int, sound_index: int, pos):
         """Контекстное меню звука."""
         menu = QMenu(self)
 
         if sound_index < 0:
             # Клик по пустому месту
-            add_action = menu.addAction("＋ Добавить звуки")
+            add_action = menu.addAction("➕ Добавить звуки")
             add_action.triggered.connect(self._on_add_sound)
             menu.exec_(pos)
             return
@@ -439,6 +532,15 @@ class MainWindow(QMainWindow):
             return
 
         sound = sounds[real_sound]
+
+        # Проверяем множественное выделение
+        selected_count = len(self._selected_sounds)
+        is_multi = selected_count > 1
+
+        if is_multi:
+            # Меню для множественного выделения
+            self._show_multi_selection_menu(menu, pos)
+            return
 
         # ── Режимы воспроизведения ──
         play_both = menu.addAction("🔊🎤 Динамик + Микрофон")
@@ -474,6 +576,11 @@ class MainWindow(QMainWindow):
             lambda: self._edit_sound_mode(real_tab, real_sound)
         )
 
+        set_keybind = menu.addAction("⌨️ Горячая клавиша")
+        set_keybind.triggered.connect(
+            lambda: self._edit_sound_keybind(real_tab, real_sound)
+        )
+
         menu.addSeparator()
 
         # ── Перемещение между вкладками ──
@@ -497,6 +604,89 @@ class MainWindow(QMainWindow):
         )
 
         menu.exec_(pos)
+
+    def _show_multi_selection_menu(self, menu: QMenu, pos):
+        """Контекстное меню для множественного выделения."""
+        selected_count = len(self._selected_sounds)
+
+        info_action = menu.addAction(f"Выбрано: {selected_count} звук(ов)")
+        info_action.setEnabled(False)
+
+        menu.addSeparator()
+
+        # Удалить выбранные
+        delete_action = menu.addAction("🗑️ Удалить выбранные")
+        delete_action.triggered.connect(self._delete_selected_sounds)
+
+        # Переместить в другую вкладку
+        if self.library.get_tab_count() > 1:
+            # Проверяем что все звуки из одной вкладки
+            tabs = set(tab_idx for tab_idx, _ in self._selected_sounds)
+            if len(tabs) == 1:
+                current_tab = list(tabs)[0]
+                move_menu = menu.addMenu("📁 Переместить в...")
+                for i in range(self.library.get_tab_count()):
+                    if i != current_tab:
+                        tab_name = self.library.get_tab_name(i)
+                        move_action = move_menu.addAction(tab_name)
+                        move_action.triggered.connect(
+                            lambda checked, to_t=i: self._move_selected_to_tab(to_t)
+                        )
+
+        menu.exec_(pos)
+
+    def _delete_selected_sounds(self):
+        """Удалить выбранные звуки."""
+        if not self._selected_sounds:
+            return
+
+        count = len(self._selected_sounds)
+        reply = QMessageBox.question(
+            self, "Удаление звуков",
+            f"Удалить {count} выбранных звук(ов)?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            # Сортируем по убыванию индексов чтобы не сбивались при удалении
+            sorted_sounds = sorted(self._selected_sounds, key=lambda x: (x[0], x[1]), reverse=True)
+
+            for tab_idx, sound_idx in sorted_sounds:
+                self.library.remove_sound(tab_idx, sound_idx)
+
+            # Обновляем только затронутые вкладки
+            affected_tabs = set(tab_idx for tab_idx, _ in sorted_sounds)
+            for tab_idx in affected_tabs:
+                self._refresh_sound_list(tab_idx)
+
+            self._selected_sounds.clear()
+            self.top_bar.set_status(f"✅ Удалено {count} звук(ов)")
+
+    def _move_selected_to_tab(self, to_tab: int):
+        """Переместить выбранные звуки в другую вкладку."""
+        if not self._selected_sounds:
+            return
+
+        # Проверяем что все из одной вкладки
+        tabs = set(tab_idx for tab_idx, _ in self._selected_sounds)
+        if len(tabs) != 1:
+            return
+
+        from_tab = list(tabs)[0]
+
+        # Сортируем по убыванию индексов
+        sorted_sounds = sorted(self._selected_sounds, key=lambda x: x[1], reverse=True)
+
+        for _, sound_idx in sorted_sounds:
+            self.library.move_sound_to_tab(from_tab, sound_idx, to_tab)
+
+        self._refresh_sound_list(from_tab)
+        self._refresh_sound_list(to_tab)
+
+        self._selected_sounds.clear()
+        self.top_bar.set_status(f"✅ Перемещено {len(sorted_sounds)} звук(ов)")
+
+    # ═══ Редактирование звуков ════════════════════════════════════
 
     def _edit_sound_name(self, tab_index: int, sound_index: int):
         """Редактирование кастомного названия звука."""
@@ -532,6 +722,68 @@ class MainWindow(QMainWindow):
         if mode:
             self.library.update_sound(tab_index, sound_index, play_mode=mode)
             self._refresh_sound_list(tab_index)
+
+    def _edit_sound_keybind(self, tab_index: int, sound_index: int):
+        """Редактирование биндинга звука."""
+        sounds = self.library.get_sounds(tab_index)
+        if not (0 <= sound_index < len(sounds)):
+            return
+
+        sound = sounds[sound_index]
+        new_keybind = SoundEditDialog.edit_keybind(self, sound.keybind)
+
+        if new_keybind != sound.keybind:
+            # Проверяем что такой биндинг не занят
+            if new_keybind:
+                conflict = self._check_keybind_conflict(tab_index, sound_index, new_keybind)
+                if conflict:
+                    tab_name, sound_name = conflict
+                    reply = QMessageBox.question(
+                        self,
+                        "Конфликт биндинга",
+                        f"Биндинг '{new_keybind}' уже используется:\n"
+                        f"Вкладка: {tab_name}\n"
+                        f"Звук: {sound_name}\n\n"
+                        f"Заменить?",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if reply == QMessageBox.No:
+                        return
+                    # Удаляем старый биндинг
+                    self._remove_conflicting_keybind(new_keybind)
+
+            self.library.update_sound(tab_index, sound_index, keybind=new_keybind)
+            self._refresh_sound_list(tab_index)
+
+            if new_keybind:
+                self.top_bar.set_status(f"✅ Установлен биндинг: {new_keybind}")
+            else:
+                self.top_bar.set_status("✅ Биндинг удалён")
+
+    def _check_keybind_conflict(self, exclude_tab: int, exclude_sound: int,
+                                 keybind: str) -> tuple[str, str] | None:
+        """
+        Проверить конфликт биндинга.
+        Возвращает (tab_name, sound_name) если найден конфликт, иначе None.
+        """
+        for tab_idx in range(self.library.get_tab_count()):
+            sounds = self.library.get_sounds(tab_idx)
+            for sound_idx, sound in enumerate(sounds):
+                if tab_idx == exclude_tab and sound_idx == exclude_sound:
+                    continue
+                if sound.keybind == keybind:
+                    tab_name = self.library.get_tab_name(tab_idx)
+                    return (tab_name, sound.display_name)
+        return None
+
+    def _remove_conflicting_keybind(self, keybind: str):
+        """Удалить конфликтующий биндинг."""
+        for tab_idx in range(self.library.get_tab_count()):
+            sounds = self.library.get_sounds(tab_idx)
+            for sound_idx, sound in enumerate(sounds):
+                if sound.keybind == keybind:
+                    self.library.update_sound(tab_idx, sound_idx, keybind="")
+                    return
 
     def _move_sound_to_tab(self, from_tab: int, sound_index: int, to_tab: int):
         """Переместить звук в другую вкладку."""
@@ -587,18 +839,54 @@ class MainWindow(QMainWindow):
 
         sound_list.clear()
 
+        if not self._search_results:
+            # Нет результатов
+            item = QListWidgetItem("🔍 Ничего не найдено")
+            item.setFlags(Qt.NoItemFlags)
+            sound_list.addItem(item)
+            return
+
         for i, (tab_idx, sound_idx, sound) in enumerate(self._search_results):
             tab_name = self.library.get_tab_name(tab_idx)
             item = QListWidgetItem()
             widget = SoundItemWidget(sound, i)
-            # Добавляем метку вкладки
+            widget.play_requested.connect(
+                lambda idx, mode: self._on_sound_play(0, idx, mode)
+            )
+            widget.pause_requested.connect(
+                lambda idx: self._on_sound_pause(0, idx)
+            )
+            widget.stop_requested.connect(
+                lambda idx: self._on_sound_stop(0, idx)
+            )
+
+            # Добавляем метку вкладки в filename_label
             if widget.filename_label is None:
-                # Создаём label для вкладки
+                # Создаём новый label для вкладки
+                main_layout = widget.layout()
+                info_layout = main_layout.itemAt(1).layout()
+
                 tab_label = QLabel(f"📁 {tab_name}")
                 tab_label.setStyleSheet("color: #6c7086; font-size: 11px;")
-            item.setSizeHint(QSize(0, 52 if not sound.custom_name else 64))
+                info_layout.addWidget(tab_label)
+                widget.filename_label = tab_label
+            else:
+                # Обновляем существующий
+                original_text = widget.filename_label.text()
+                widget.filename_label.setText(f"📁 {tab_name} • {original_text}")
+
+            # Высота
+            base_height = 64
+            if sound.custom_name:
+                base_height += 14
+            if sound.keybind:
+                base_height += 4
+
+            item.setSizeHint(QSize(0, base_height))
             sound_list.addItem(item)
             sound_list.setItemWidget(item, widget)
+
+        self.top_bar.set_status(f"🔍 Найдено: {len(self._search_results)}")
 
     # ═══ Управление воспроизведением ═════════════════════════════
 
@@ -634,6 +922,19 @@ class MainWindow(QMainWindow):
             return
 
         sound_list = self.sound_lists[tab_index]
+
+        # Если в режиме поиска — ищем по результатам
+        if self._is_searching:
+            for i, (t_idx, s_idx, _) in enumerate(self._search_results):
+                if t_idx == tab_index and s_idx == sound_index:
+                    if 0 <= i < sound_list.count():
+                        item = sound_list.item(i)
+                        widget = sound_list.itemWidget(item)
+                        if isinstance(widget, SoundItemWidget):
+                            widget.set_playing(playing)
+            return
+
+        # Обычный режим
         if 0 <= sound_index < sound_list.count():
             item = sound_list.item(sound_index)
             widget = sound_list.itemWidget(item)
@@ -650,12 +951,43 @@ class MainWindow(QMainWindow):
                     widget.set_playing(False)
 
     def _update_playing_count(self):
-        """Обновить счётчик играющих звуков."""
+        """Обновить счётчик играющих звуков и динамические шкалы прогресса."""
         count = self.engine.playing_count
         if count > 0:
             self.playing_count_label.setText(f"▶ Играет: {count}")
         else:
             self.playing_count_label.setText("")
+
+        # Получаем данные активных воспроизведений
+        active_playbacks = self.engine.get_active_playbacks()
+
+        active_sound_map = {}
+        with self._playing_lock:
+            for ch_id, pinfo in active_playbacks.items():
+                if ch_id in self._playing_channels:
+                    loc = self._playing_channels[ch_id]
+                    active_sound_map[loc] = pinfo
+
+        for tab_idx, sound_list in self.sound_lists.items():
+            for row in range(sound_list.count()):
+                item = sound_list.item(row)
+                widget = sound_list.itemWidget(item)
+                if isinstance(widget, SoundItemWidget):
+                    if self._is_searching and self._search_results and row < len(self._search_results):
+                        real_t, real_s, _ = self._search_results[row]
+                        key = (real_t, real_s)
+                    else:
+                        key = (tab_idx, widget.index)
+
+                    if key in active_sound_map:
+                        pinfo = active_sound_map[key]
+                        widget.set_playback_progress(
+                            pinfo["elapsed"],
+                            pinfo["duration"],
+                            pinfo["is_paused"]
+                        )
+                    elif widget._is_playing:
+                        widget.set_stopped()
 
     # ═══ Callbacks из потоков ════════════════════════════════════
 
@@ -689,11 +1021,22 @@ class MainWindow(QMainWindow):
         # Обновляем мастер-громкость
         self.top_bar.set_volume(self.config.get("master_volume", 75))
 
-        # Перезапускаем движок для применения настроек PipeWire
+        # Получаем новое устройство вывода
+        new_sink = self.config.get("speaker_sink", "")
+
+        # Перезапускаем движок для применения настроек
         def _restart():
-            self.engine.restart()
-            if self.engine.is_active:
-                self.signals.status_update.emit("✅ Перезапущен")
+            self.engine.stop()
+            import time
+            time.sleep(0.5)
+
+            # Применяем новый sink
+            if new_sink:
+                self.engine.set_speaker_sink(new_sink)
+
+            success = self.engine.start()
+            if success:
+                self.signals.status_update.emit("✅ Настройки применены")
             else:
                 self.signals.status_update.emit("❌ Ошибка перезапуска")
 
@@ -708,20 +1051,16 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Обработка закрытия окна."""
-        # Сохраняем размеры окна
         self.config.update_settings({
             "window_width": self.width(),
             "window_height": self.height()
         })
 
-        # Останавливаем движок
+        self.library.stop_keybinds()
         self.playing_timer.stop()
-
-        def _shutdown():
+        try:
             self.engine.stop()
-
-        thread = threading.Thread(target=_shutdown, daemon=True)
-        thread.start()
-        thread.join(timeout=3)
+        except Exception:
+            pass
 
         event.accept()

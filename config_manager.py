@@ -16,6 +16,7 @@ TABS_FILE = os.path.join(PROJECT_DIR, "tabs.json")
 DEFAULT_SETTINGS = {
     "device_name": "botyaraPAD",
     "source_mic": "",
+    "speaker_sink": "",  # Устройство вывода для динамика
     "pass_through_mic": True,
     "theme": "dark",
     "default_play_mode": "both",  # "both", "mic", "speaker"
@@ -157,7 +158,8 @@ class ConfigManager:
             "path": str,
             "custom_name": str,
             "volume": int (0-100),
-            "play_mode": str ("both"/"mic"/"speaker")
+            "play_mode": str ("both"/"mic"/"speaker"),
+            "keybind": str (опционально, например "Ctrl+1")
         }
         """
         tabs = self.tabs_data.get("tabs", [])
@@ -181,6 +183,16 @@ class ConfigManager:
             sounds = tabs[tab_index].get("sounds", [])
             if 0 <= sound_index < len(sounds):
                 sounds[sound_index].update(sound_data)
+                self.save_tabs()
+
+    def move_sound(self, tab_index: int, from_index: int, to_index: int):
+        """Переместить звук внутри вкладки."""
+        tabs = self.tabs_data.get("tabs", [])
+        if 0 <= tab_index < len(tabs):
+            sounds = tabs[tab_index].get("sounds", [])
+            if 0 <= from_index < len(sounds) and 0 <= to_index < len(sounds):
+                sound = sounds.pop(from_index)
+                sounds.insert(to_index, sound)
                 self.save_tabs()
 
     def move_sound_to_tab(self, from_tab: int, sound_index: int, to_tab: int):

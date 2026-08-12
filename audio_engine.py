@@ -30,14 +30,47 @@ class PipeWireVirtualMic:
         self._monitor_source_name = ""
         self._sink_name = ""
 
+    @staticmethod
+    def cleanup_orphaned_modules(device_name: str = "botyaraPAD"):
+        """Выгрузить абсолютно все унаследованные/застрявшие/дублирующиеся модули botyaraPAD из PipeWire."""
+        try:
+            result = subprocess.run(
+                ["pactl", "list", "modules", "short"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                sanitized_name = re.sub(r'[^a-zA-Z0-9_]', '_', device_name)
+                for line in result.stdout.strip().split("\n"):
+                    if not line.strip():
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        mod_id = parts[0]
+                        mod_args = " ".join(parts[1:])
+                        if any(k in mod_args for k in [device_name, sanitized_name, "botyaraPAD"]):
+                            try:
+                                subprocess.run(
+                                    ["pactl", "unload-module", mod_id],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=3
+                                )
+                                print(f"[PipeWire] Выгружен старый/дублирующий модуль {mod_id}")
+                            except Exception:
+                                pass
+        except Exception as e:
+            print(f"[PipeWire] Ошибка очистки старых модулей: {e}")
+
     def create(self) -> bool:
         """
         Создать виртуальный микрофон.
-        Создаёт null-sink (куда будем писать звук) и remap-source (виртуальный микрофон).
-        Возвращает True при успехе.
+        Гарантированно выгружает все старые дублирующиеся модули перед созданием.
         """
-        if self.is_active:
-            self.destroy()
+        # Всегда предварительно чистим любые дубликаты
+        self.cleanup_orphaned_modules(self.device_name)
+        self.is_active = False
 
         sanitized_name = re.sub(r'[^a-zA-Z0-9_]', '_', self.device_name)
 
@@ -90,7 +123,6 @@ class PipeWireVirtualMic:
 
             if result.returncode != 0:
                 print(f"[PipeWire] Ошибка создания remap-source: {result.stderr}")
-                # Откатываем null-sink
                 self._unload_module(self.sink_module_id)
                 self.sink_module_id = None
                 return False
@@ -107,15 +139,10 @@ class PipeWireVirtualMic:
             return False
 
     def destroy(self):
-        """Удалить виртуальный микрофон."""
-        if self.remap_module_id is not None:
-            self._unload_module(self.remap_module_id)
-            self.remap_module_id = None
-
-        if self.sink_module_id is not None:
-            self._unload_module(self.sink_module_id)
-            self.sink_module_id = None
-
+        """Удалить виртуальный микрофон и вычистить все модули."""
+        self.cleanup_orphaned_modules(self.device_name)
+        self.sink_module_id = None
+        self.remap_module_id = None
         self.is_active = False
         print("[PipeWire] Виртуальный микрофон удалён")
 
@@ -253,19 +280,21 @@ class PipeWireVirtualMic:
 class MicPassthrough:
     """
     Прокидывание реального микрофона в виртуальный.
-    Использует parec/pacat для передачи аудио с реального микрофона
-    в наш виртуальный sink.
+    Использует parec/pacat, направленные строго в виртуальный sink (botyaraPAD_sink).
+    Благодаря этому ваш голос попадает в виртуальный микрофон для Discord/игр,
+    но НЕ прослушивается в ваших собственных наушниках/динамиках.
     """
 
     def __init__(self):
-        self._process: Optional[subprocess.Popen] = None
         self._is_running = False
         self._lock = threading.Lock()
+        self._parec = None
+        self._pacat = None
 
     def start(self, source_name: str, sink_name: str):
         """
         Начать передачу аудио с source_name (реальный микрофон)
-        в sink_name (наш виртуальный sink).
+        строго в sink_name (виртуальный sink).
         """
         with self._lock:
             if self._is_running:
@@ -275,9 +304,11 @@ class MicPassthrough:
                 print("[MicPassthrough] Не указан источник или приёмник")
                 return
 
+            # Выгружаем возможные застрявшие петли module-loopback
+            self._unload_existing_loopbacks(sink_name)
+
             try:
-                # parec читает из source, pacat пишет в sink
-                # Используем pipe между ними
+                # parec читает из микрофона
                 self._parec = subprocess.Popen(
                     [
                         "parec",
@@ -285,12 +316,15 @@ class MicPassthrough:
                         "--format=s16le",
                         "--rate=44100",
                         "--channels=2",
-                        "--latency-msec=20"
+                        "--latency-msec=20",
+                        "--process-time=5ms",
+                        "--stream-name=botyaraPAD_mic_in"
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL
                 )
 
+                # pacat пишет СТРОГО в виртуальный sink (не в наушники)
                 self._pacat = subprocess.Popen(
                     [
                         "pacat",
@@ -298,42 +332,67 @@ class MicPassthrough:
                         "--format=s16le",
                         "--rate=44100",
                         "--channels=2",
-                        "--latency-msec=20"
+                        "--latency-msec=20",
+                        "--process-time=5ms",
+                        "--stream-name=botyaraPAD_mic_out"
                     ],
                     stdin=self._parec.stdout,
                     stderr=subprocess.DEVNULL
                 )
 
-                # Позволяем parec закрыть stdout когда pacat закончит
                 self._parec.stdout.close()
-
                 self._is_running = True
-                print(f"[MicPassthrough] Запущено: {source_name} -> {sink_name}")
+                print(f"[MicPassthrough] Запущено изолированно: {source_name} -> {sink_name}")
 
             except (FileNotFoundError, OSError) as e:
                 print(f"[MicPassthrough] Ошибка запуска: {e}")
                 self._cleanup_processes()
 
+    def _unload_existing_loopbacks(self, sink_name: str):
+        """Гарантированно выгрузить любые старые петли module-loopback."""
+        try:
+            result = subprocess.run(
+                ["pactl", "list", "modules", "short"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    if "module-loopback" in line and sink_name in line:
+                        parts = line.split("\t")
+                        if len(parts) >= 1 and parts[0].isdigit():
+                            mod_id = parts[0]
+                            try:
+                                subprocess.run(
+                                    ["pactl", "unload-module", mod_id],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=3
+                                )
+                                print(f"[MicPassthrough] Очищен старый loopback модуль {mod_id}")
+                            except Exception:
+                                pass
+        except Exception as e:
+            print(f"[MicPassthrough] Ошибка при очистке старых loopback: {e}")
+
     def stop(self):
         """Остановить передачу."""
         with self._lock:
+            self._unload_existing_loopbacks("botyaraPAD_sink")
             self._cleanup_processes()
             self._is_running = False
             print("[MicPassthrough] Остановлено")
 
     def _cleanup_processes(self):
-        """Корректно завершить процессы."""
+        """Мгновенно завершить процессы."""
         for proc_name in ('_pacat', '_parec'):
             proc = getattr(self, proc_name, None)
             if proc is not None:
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except (subprocess.TimeoutExpired, OSError):
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+                    proc.kill()
+                except OSError:
+                    pass
                 setattr(self, proc_name, None)
 
     @property
@@ -358,28 +417,36 @@ class SoundPlayer:
         self._lock = threading.Lock()
         self._master_volume = 1.0
         self._pacat_processes: dict[int, subprocess.Popen] = {}  # channel_id -> pacat process
+        self._speaker_sink = ""  # Устройство вывода для динамика
 
         # Callbacks
         self.on_sound_finished: Optional[Callable[[int], None]] = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_running = False
 
-    def initialize(self):
+    def initialize(self, speaker_sink: str = ""):
         """Инициализировать pygame.mixer."""
         if self._initialized:
             return
 
+        self._speaker_sink = speaker_sink
+
         try:
+            # Если указан конкретный sink — устанавливаем через environment
+            if speaker_sink:
+                os.environ['SDL_AUDIODRIVER'] = 'pulseaudio'
+                os.environ['PULSE_SINK'] = speaker_sink
+
             pygame.mixer.init(
                 frequency=44100,
                 size=-16,
                 channels=2,
-                buffer=1024
+                buffer=512  # Уменьшили буфер для меньшей задержки
             )
             pygame.mixer.set_num_channels(self.MAX_CHANNELS)
             self._initialized = True
             self._start_monitor()
-            print("[SoundPlayer] pygame.mixer инициализирован")
+            print(f"[SoundPlayer] pygame.mixer инициализирован (sink: {speaker_sink or 'default'})")
         except pygame.error as e:
             print(f"[SoundPlayer] Ошибка инициализации pygame.mixer: {e}")
 
@@ -398,7 +465,20 @@ class SoundPlayer:
                 pass
             self._initialized = False
 
+        # Очищаем environment
+        os.environ.pop('PULSE_SINK', None)
+
         print("[SoundPlayer] Завершён")
+
+    def set_speaker_sink(self, sink_name: str):
+        """Изменить устройство вывода (требует переинициализации)."""
+        if sink_name != self._speaker_sink:
+            was_initialized = self._initialized
+            if was_initialized:
+                self.shutdown()
+            self._speaker_sink = sink_name
+            if was_initialized:
+                self.initialize(sink_name)
 
     def _start_monitor(self):
         """Запустить мониторинг завершения воспроизведения."""
@@ -409,7 +489,7 @@ class SoundPlayer:
     def _monitor_loop(self):
         """Мониторинг завершения воспроизведения звуков."""
         while self._monitor_running:
-            time.sleep(0.1)
+            time.sleep(0.05)  # Уменьшили интервал для более быстрой реакции
             with self._lock:
                 finished = []
                 for ch_id, info in self._channels.items():
@@ -475,6 +555,9 @@ class SoundPlayer:
         # Воспроизводим
         channel.play(sound, loops=loops)
 
+        start_time = time.time()
+        duration = sound.get_length() if sound else 0.0
+
         with self._lock:
             self._channels[channel_id] = {
                 "channel": channel,
@@ -483,6 +566,10 @@ class SoundPlayer:
                 "volume": volume,
                 "play_mode": play_mode,
                 "loop": loop,
+                "start_time": start_time,
+                "duration": duration,
+                "is_paused": False,
+                "pause_start": 0.0,
             }
 
         # Если нужно отправлять в виртуальный микрофон
@@ -525,7 +612,7 @@ class SoundPlayer:
                         "--format=s16le",
                         "--rate=44100",
                         "--channels=2",
-                        "--latency-msec=20"
+                        "--latency-msec=10"  # Уменьшили задержку
                     ],
                     stdin=ffmpeg_proc.stdout,
                     stderr=subprocess.DEVNULL
@@ -579,21 +666,106 @@ class SoundPlayer:
             except pygame.error:
                 pass
 
-        # Останавливаем ffmpeg/pacat процессы
-        for proc_key in ("ffmpeg_proc", "pacat_proc"):
+        # Мгновенно останавливаем ffmpeg/pacat процессы через SIGKILL (без задержек)
+        for proc_key in ("pacat_proc", "ffmpeg_proc"):
             proc = info.get(proc_key)
             if proc is not None:
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except (subprocess.TimeoutExpired, OSError):
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+                    proc.kill()
+                except OSError:
+                    pass
 
         # Убираем из pacat_processes
         self._pacat_processes.pop(channel_id, None)
+
+    def pause(self, channel_id: int):
+        """Поставить звук на паузу."""
+        with self._lock:
+            info = self._channels.get(channel_id)
+            if not info or info.get("is_paused"):
+                return
+            channel = info.get("channel")
+            if channel:
+                try:
+                    channel.pause()
+                except pygame.error:
+                    pass
+            for proc_key in ("pacat_proc", "ffmpeg_proc"):
+                proc = info.get(proc_key)
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.send_signal(signal.SIGSTOP)
+                    except OSError:
+                        pass
+            info["is_paused"] = True
+            info["pause_start"] = time.time()
+
+    def unpause(self, channel_id: int):
+        """Снять звук с паузы."""
+        with self._lock:
+            info = self._channels.get(channel_id)
+            if not info or not info.get("is_paused"):
+                return
+            channel = info.get("channel")
+            if channel:
+                try:
+                    channel.unpause()
+                except pygame.error:
+                    pass
+            for proc_key in ("pacat_proc", "ffmpeg_proc"):
+                proc = info.get(proc_key)
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.send_signal(signal.SIGCONT)
+                    except OSError:
+                        pass
+            pause_duration = time.time() - info.get("pause_start", time.time())
+            info["start_time"] = info.get("start_time", time.time()) + pause_duration
+            info["is_paused"] = False
+
+    def toggle_pause(self, channel_id: int):
+        """Переключить состояние паузы."""
+        info = self._channels.get(channel_id)
+        if info:
+            if info.get("is_paused"):
+                self.unpause(channel_id)
+            else:
+                self.pause(channel_id)
+
+    def get_active_playbacks(self) -> dict:
+        """
+        Получить активные воспроизведения и прогресс.
+        Возвращает dict {channel_id: {"elapsed": float, "duration": float, "progress": float, "is_paused": bool, "wav_path": str}}
+        """
+        now = time.time()
+        result = {}
+        with self._lock:
+            for ch_id, info in self._channels.items():
+                channel = info.get("channel")
+                duration = info.get("duration", 0.0)
+                is_paused = info.get("is_paused", False)
+
+                if is_paused:
+                    elapsed = info.get("pause_start", now) - info.get("start_time", now)
+                else:
+                    elapsed = now - info.get("start_time", now)
+
+                if duration > 0 and info.get("loop"):
+                    elapsed = elapsed % duration
+
+                elapsed = max(0.0, elapsed)
+                progress = min(1.0, elapsed / duration) if duration > 0 else 0.0
+
+                is_busy = (channel and channel.get_busy()) or ("ffmpeg_proc" in info) or is_paused
+                if is_busy:
+                    result[ch_id] = {
+                        "elapsed": elapsed,
+                        "duration": duration,
+                        "progress": progress,
+                        "is_paused": is_paused,
+                        "wav_path": info.get("wav_path", ""),
+                    }
+        return result
 
     def set_master_volume(self, volume: float):
         """
@@ -668,8 +840,11 @@ class AudioEngine:
         2. Создать виртуальный микрофон
         3. Запустить прокидывание реального микрофона (если включено)
         """
+        # Получаем устройство вывода
+        speaker_sink = self.config.get("speaker_sink", "")
+
         # Инициализируем плеер
-        self.player.initialize()
+        self.player.initialize(speaker_sink)
 
         # Устанавливаем мастер-громкость
         master_vol = self.config.get("master_volume", 75) / 100.0
@@ -709,6 +884,11 @@ class AudioEngine:
         self.stop()
         time.sleep(0.5)
         self.start()
+
+    def set_speaker_sink(self, sink_name: str):
+        """Изменить устройство вывода."""
+        self.config.set("speaker_sink", sink_name)
+        self.player.set_speaker_sink(sink_name)
 
     def play_sound(self, wav_path: str, volume: float = 1.0,
                    play_mode: str = "both", loop: bool = False) -> int:
@@ -790,7 +970,7 @@ class AudioEngine:
                         "--format=s16le",
                         "--rate=44100",
                         "--channels=2",
-                        "--latency-msec=20"
+                        "--latency-msec=10"
                     ],
                     stdin=ffmpeg_proc.stdout,
                     stderr=subprocess.DEVNULL
@@ -834,6 +1014,22 @@ class AudioEngine:
     def stop_sound(self, channel_id: int):
         """Остановить конкретный звук."""
         self.player.stop(channel_id)
+
+    def pause_sound(self, channel_id: int):
+        """Поставить звук на паузу."""
+        self.player.pause(channel_id)
+
+    def unpause_sound(self, channel_id: int):
+        """Снять звук с паузы."""
+        self.player.unpause(channel_id)
+
+    def toggle_pause(self, channel_id: int):
+        """Переключить паузу звука."""
+        self.player.toggle_pause(channel_id)
+
+    def get_active_playbacks(self) -> dict:
+        """Получить статус и прогресс всех активных воспроизведений."""
+        return self.player.get_active_playbacks()
 
     def stop_all_sounds(self):
         """Остановить все звуки."""

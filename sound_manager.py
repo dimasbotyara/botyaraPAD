@@ -1,13 +1,15 @@
 """
 botyaraPAD - Sound Manager
-Управление метаданными звуков: длительность, форматы, конвертация.
+Управление метаданными звуков: длительность, форматы, конвертация, биндинг клавиш.
 """
 
 import os
 import subprocess
 import json
 import threading
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
+
+from pynput import keyboard
 
 
 # Поддерживаемые форматы
@@ -138,15 +140,80 @@ def cleanup_temp_files(temp_dir: str = "/tmp/botyarapad"):
             print(f"[SoundManager] Ошибка очистки временных файлов: {e}")
 
 
+def parse_keybind(keybind_str: str) -> Optional[set]:
+    """
+    Парсинг строки биндинга в набор клавиш.
+    Например: "Ctrl+Shift+A" -> {Key.ctrl_l, Key.shift, KeyCode(char='a')}
+    """
+    if not keybind_str or keybind_str.strip() == "":
+        return None
+
+    parts = [p.strip().lower() for p in keybind_str.split('+')]
+    keys = set()
+
+    key_mapping = {
+        'ctrl': keyboard.Key.ctrl_l,
+        'control': keyboard.Key.ctrl_l,
+        'alt': keyboard.Key.alt_l,
+        'shift': keyboard.Key.shift,
+        'super': keyboard.Key.cmd,
+        'win': keyboard.Key.cmd,
+        'meta': keyboard.Key.cmd,
+    }
+
+    for part in parts:
+        if part in key_mapping:
+            keys.add(key_mapping[part])
+        elif len(part) == 1:
+            # Обычная клавиша
+            keys.add(keyboard.KeyCode.from_char(part))
+        else:
+            # Пытаемся как специальную клавишу
+            try:
+                keys.add(getattr(keyboard.Key, part))
+            except AttributeError:
+                print(f"[Keybind] Неизвестная клавиша: {part}")
+                return None
+
+    return keys if keys else None
+
+
+def format_keybind(keys_set: Optional[set]) -> str:
+    """Форматировать набор клавиш обратно в строку."""
+    if not keys_set:
+        return ""
+
+    parts = []
+    for key in keys_set:
+        if isinstance(key, keyboard.Key):
+            name = key.name
+            if name in ('ctrl_l', 'ctrl_r'):
+                parts.append('Ctrl')
+            elif name in ('alt_l', 'alt_r'):
+                parts.append('Alt')
+            elif name in ('shift', 'shift_l', 'shift_r'):
+                parts.append('Shift')
+            elif name in ('cmd', 'cmd_l', 'cmd_r'):
+                parts.append('Super')
+            else:
+                parts.append(name.capitalize())
+        elif isinstance(key, keyboard.KeyCode):
+            if key.char:
+                parts.append(key.char.upper())
+
+    return '+'.join(sorted(parts))
+
+
 class SoundInfo:
     """Информация о звуковом файле."""
 
     def __init__(self, path: str, custom_name: str = "", volume: int = 100,
-                 play_mode: str = "both"):
+                 play_mode: str = "both", keybind: str = ""):
         self.path = path
         self.custom_name = custom_name
         self.volume = volume  # 0-100
         self.play_mode = play_mode  # "both", "mic", "speaker"
+        self.keybind = keybind  # строка типа "Ctrl+Shift+A"
         self._duration: Optional[float] = None
         self._duration_loaded = False
         self._wav_cache: Optional[str] = None
@@ -206,6 +273,7 @@ class SoundInfo:
             "custom_name": self.custom_name,
             "volume": self.volume,
             "play_mode": self.play_mode,
+            "keybind": self.keybind,
         }
 
     @classmethod
@@ -216,10 +284,119 @@ class SoundInfo:
             custom_name=data.get("custom_name", ""),
             volume=data.get("volume", 100),
             play_mode=data.get("play_mode", "both"),
+            keybind=data.get("keybind", ""),
         )
 
     def __repr__(self):
-        return f"SoundInfo('{self.display_name}', vol={self.volume}, mode={self.play_mode})"
+        return f"SoundInfo('{self.display_name}', vol={self.volume}, mode={self.play_mode}, bind={self.keybind})"
+
+
+class KeybindManager:
+    """Менеджер горячих клавиш для звуков."""
+
+    def __init__(self):
+        self._bindings: dict[frozenset, Callable] = {}  # frozenset клавиш -> callback
+        self._pressed_keys: set = set()
+        self._listener: Optional[keyboard.Listener] = None
+        self._lock = threading.Lock()
+        self._enabled = True
+
+    def start(self):
+        """Запустить прослушивание клавиатуры."""
+        if self._listener is not None:
+            return
+
+        self._listener = keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release
+        )
+        self._listener.start()
+        print("[KeybindManager] Запущен")
+
+    def stop(self):
+        """Остановить прослушивание."""
+        if self._listener is not None:
+            self._listener.stop()
+            self._listener = None
+        self._bindings.clear()
+        self._pressed_keys.clear()
+        print("[KeybindManager] Остановлен")
+
+    def set_enabled(self, enabled: bool):
+        """Включить/выключить обработку биндов."""
+        self._enabled = enabled
+
+    def register(self, keybind_str: str, callback: Callable):
+        """
+        Зарегистрировать биндинг.
+        keybind_str: строка типа "Ctrl+Shift+A"
+        callback: функция без аргументов
+        """
+        keys = parse_keybind(keybind_str)
+        if keys is None:
+            return False
+
+        with self._lock:
+            key_frozen = frozenset(keys)
+            self._bindings[key_frozen] = callback
+
+        print(f"[KeybindManager] Зарегистрирован: {keybind_str}")
+        return True
+
+    def unregister(self, keybind_str: str):
+        """Удалить биндинг."""
+        keys = parse_keybind(keybind_str)
+        if keys is None:
+            return
+
+        with self._lock:
+            key_frozen = frozenset(keys)
+            self._bindings.pop(key_frozen, None)
+
+    def unregister_all(self):
+        """Удалить все биндинги."""
+        with self._lock:
+            self._bindings.clear()
+
+    def _normalize_key(self, key):
+        """Нормализация клавиш (ctrl_l и ctrl_r -> ctrl_l и т.д.)."""
+        if hasattr(key, 'name'):
+            name = key.name
+            if name in ('ctrl_r',):
+                return keyboard.Key.ctrl_l
+            elif name in ('alt_r',):
+                return keyboard.Key.alt_l
+            elif name in ('shift_r', 'shift_l'):
+                return keyboard.Key.shift
+            elif name in ('cmd_r', 'cmd_l'):
+                return keyboard.Key.cmd
+        return key
+
+    def _on_press(self, key):
+        """Обработка нажатия клавиши."""
+        if not self._enabled:
+            return
+
+        key = self._normalize_key(key)
+        self._pressed_keys.add(key)
+
+        # Проверяем есть ли совпадение с зарегистрированными комбинациями
+        with self._lock:
+            current_combo = frozenset(self._pressed_keys)
+            callback = self._bindings.get(current_combo)
+            if callback:
+                try:
+                    callback()
+                except Exception as e:
+                    print(f"[KeybindManager] Ошибка в callback: {e}")
+
+    def _on_release(self, key):
+        """Обработка отпускания клавиши."""
+        if not self._enabled:
+            return
+
+        key = self._normalize_key(key)
+        self._pressed_keys.discard(key)
 
 
 class SoundLibrary:
@@ -228,6 +405,8 @@ class SoundLibrary:
     def __init__(self, config_manager):
         self.config = config_manager
         self.tabs: list[Tuple[str, list[SoundInfo]]] = []  # [(name, [SoundInfo, ...]), ...]
+        self.keybind_manager = KeybindManager()
+        self._sound_play_callback: Optional[Callable[[int, int], None]] = None
         self._load_from_config()
 
     def _load_from_config(self):
@@ -257,6 +436,40 @@ class SoundLibrary:
         self.config.tabs_data = tabs_data
         self.config.save_tabs()
 
+    def start_keybinds(self, play_callback: Callable[[int, int], None]):
+        """
+        Запустить систему биндов.
+        play_callback(tab_index, sound_index) вызывается при нажатии биндинга.
+        """
+        self._sound_play_callback = play_callback
+        self.keybind_manager.start()
+        self._register_all_keybinds()
+
+    def stop_keybinds(self):
+        """Остановить систему биндов."""
+        self.keybind_manager.stop()
+        self._sound_play_callback = None
+
+    def _register_all_keybinds(self):
+        """Зарегистрировать все биндинги из всех звуков."""
+        self.keybind_manager.unregister_all()
+
+        for tab_idx, (_, sounds) in enumerate(self.tabs):
+            for sound_idx, sound in enumerate(sounds):
+                if sound.keybind:
+                    self._register_sound_keybind(tab_idx, sound_idx, sound.keybind)
+
+    def _register_sound_keybind(self, tab_idx: int, sound_idx: int, keybind: str):
+        """Зарегистрировать биндинг для конкретного звука."""
+        if not keybind or not self._sound_play_callback:
+            return
+
+        def callback():
+            if self._sound_play_callback:
+                self._sound_play_callback(tab_idx, sound_idx)
+
+        self.keybind_manager.register(keybind, callback)
+
     def get_tab_count(self) -> int:
         """Количество вкладок."""
         return len(self.tabs)
@@ -283,6 +496,7 @@ class SoundLibrary:
         if 0 <= index < len(self.tabs) and len(self.tabs) > 1:
             self.tabs.pop(index)
             self._save_to_config()
+            self._register_all_keybinds()
 
     def rename_tab(self, index: int, new_name: str):
         """Переименовать вкладку."""
@@ -316,6 +530,7 @@ class SoundLibrary:
             if 0 <= sound_index < len(sounds):
                 sounds.pop(sound_index)
                 self._save_to_config()
+                self._register_all_keybinds()
 
     def update_sound(self, tab_index: int, sound_index: int, **kwargs):
         """Обновить параметры звука."""
@@ -327,6 +542,18 @@ class SoundLibrary:
                     if hasattr(sound, key):
                         setattr(sound, key, value)
                 self._save_to_config()
+                # Если изменился биндинг — перерегистрируем
+                if 'keybind' in kwargs:
+                    self._register_all_keybinds()
+
+    def move_sound(self, tab_index: int, from_index: int, to_index: int):
+        """Переместить звук внутри вкладки."""
+        if 0 <= tab_index < len(self.tabs):
+            sounds = self.tabs[tab_index][1]
+            if 0 <= from_index < len(sounds) and 0 <= to_index < len(sounds):
+                sound = sounds.pop(from_index)
+                sounds.insert(to_index, sound)
+                self._save_to_config()
 
     def move_sound_to_tab(self, from_tab: int, sound_index: int, to_tab: int):
         """Переместить звук между вкладками."""
@@ -336,6 +563,7 @@ class SoundLibrary:
                 sound = sounds.pop(sound_index)
                 self.tabs[to_tab][1].append(sound)
                 self._save_to_config()
+                self._register_all_keybinds()
 
     def search_sounds(self, query: str) -> list[Tuple[int, int, SoundInfo]]:
         """
